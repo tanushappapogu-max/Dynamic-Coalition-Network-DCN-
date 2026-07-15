@@ -23,10 +23,15 @@ class CoalitionGraphFFN(nn.Module):
             for _ in range(n_nodes)
         ])
 
-        self.keys = nn.Parameter(torch.randn(n_nodes, d_model) * 0.02)
-        self.edge_logits = nn.Parameter(torch.zeros(n_nodes, n_nodes))
-        self.seed_threshold = nn.Parameter(torch.tensor(0.0))
-        self.recruit_threshold = nn.Parameter(torch.tensor(0.0))
+        # Keys for seed selection — initialized with proper scale
+        self.keys = nn.Parameter(torch.randn(n_nodes, d_model) / math.sqrt(d_model))
+
+        # Edge weights for recruitment — init negative so most edges start weak
+        # sigmoid(-2) ≈ 0.12, so initial recruitment signal is low
+        self.edge_logits = nn.Parameter(torch.randn(n_nodes, n_nodes) * 0.5 - 2.0)
+
+        # Recruitment threshold — start above typical recruit_signal so nodes must earn recruitment
+        self.recruit_threshold = nn.Parameter(torch.tensor(0.5))
 
         self._temperature = 1.0
 
@@ -40,32 +45,52 @@ class CoalitionGraphFFN(nn.Module):
 
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, dict]:
         batch, seq_len, d_model = x.shape
-        x_pooled = x.mean(dim=1)
 
-        seed_scores = x_pooled @ self.keys.T
+        # Seed selection: use sequence-pooled representation to pick which nodes activate
+        x_pooled = x.mean(dim=1)  # (batch, d_model)
+        seed_scores = x_pooled @ self.keys.T  # (batch, n_nodes)
 
-        edge_weights = torch.sigmoid(self.edge_logits)
-        mask = 1.0 - torch.eye(self.n_nodes, device=x.device)
-        edge_weights = edge_weights * mask
-
+        # Top-k seed selection (always activates exactly n_seeds nodes)
+        # Soft version: use softmax over seed scores for differentiable weighting
         tau = self._temperature
 
-        seed_activation = torch.sigmoid((seed_scores - self.seed_threshold) / tau)
+        # Hard top-k mask for seed activation
+        _, top_indices = seed_scores.topk(self.n_seeds, dim=-1)
+        hard_seed_mask = torch.zeros_like(seed_scores)
+        hard_seed_mask.scatter_(1, top_indices, 1.0)
 
-        recruit_signal = seed_activation @ edge_weights
+        # Soft seed scores (differentiable)
+        soft_seed_scores = F.softmax(seed_scores / tau, dim=-1)
 
+        # Straight-through: use hard mask in forward, soft scores in backward
+        seed_activation = hard_seed_mask + soft_seed_scores - soft_seed_scores.detach()
+
+        # Recruitment via learned edges
+        edge_weights = torch.sigmoid(self.edge_logits)
+        diag_mask = 1.0 - torch.eye(self.n_nodes, device=x.device)
+        edge_weights = edge_weights * diag_mask
+
+        # Recruitment signal: how strongly do active seeds recruit each node?
+        recruit_signal = seed_activation @ edge_weights  # (batch, n_nodes)
+
+        # Soft recruitment threshold
         recruit_activation = torch.sigmoid((recruit_signal - self.recruit_threshold) / tau)
 
+        # Final activation: seed OR recruited (soft-OR)
         node_activation = seed_activation + recruit_activation - seed_activation * recruit_activation
 
-        node_outputs = torch.stack([node(x_pooled) for node in self.nodes], dim=1)
+        # Each node processes the full per-token input
+        # Stack all node outputs: (batch, n_nodes, seq_len, d_model)
+        node_outputs = torch.stack([node(x) for node in self.nodes], dim=1)
 
-        weighted = node_activation.unsqueeze(-1) * node_outputs
-        output = weighted.sum(dim=1)
-        activation_sum = node_activation.sum(dim=1, keepdim=True).clamp(min=1e-6)
-        output = output / activation_sum
+        # Weight by activation and sum across nodes
+        # node_activation: (batch, n_nodes) -> (batch, n_nodes, 1, 1)
+        weights = node_activation.unsqueeze(-1).unsqueeze(-1)
+        weighted = (weights * node_outputs).sum(dim=1)  # (batch, seq_len, d_model)
 
-        output = output.unsqueeze(1).expand(-1, seq_len, -1)
+        # Normalize by total activation
+        activation_sum = node_activation.sum(dim=1, keepdim=True).unsqueeze(-1).clamp(min=1e-6)
+        output = weighted / activation_sum  # (batch, seq_len, d_model)
 
         aux_data = {
             'node_activation': node_activation,
