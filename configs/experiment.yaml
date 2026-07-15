@@ -1,0 +1,55 @@
+data:
+  train_size: 80000
+  val_size: 10000
+  test_size: 10000
+  gen_test_size: 5000
+  train_num_ops: [2, 5]
+  train_max_nesting: 2
+  gen_num_ops: [6, 9]
+  gen_max_nesting: 4
+  max_input_len: 64
+  max_output_len: 5
+  seed: 42
+
+model:
+  d_model: 128
+  n_layers: 4
+  n_heads: 4
+  dropout: 0.1
+  vocab_size: 20
+  max_seq_len: 64
+  max_output_len: 5
+
+dense:
+  d_ffn: 1024
+
+moe:
+  n_experts: 16
+  top_k: 2
+  d_expert: 64
+  balance_coef: 0.01
+
+coalition:
+  n_nodes: 16
+  d_node: 64
+  n_seeds: 4
+  temp_start: 1.0
+  temp_end: 0.1
+  warmup_fraction: 0.1
+  balance_coef: 0.01
+  size_coef: 0.001
+  target_coalition_size: 6
+
+training:
+  batch_size: 128
+  learning_rate: 3.0e-4
+  weight_decay: 0.01
+  epochs: 50
+  grad_clip: 1.0
+  scheduler: cosine
+  warmup_epochs: 5
+
+evaluation:
+  n_timing_samples: 1000
+  n_specialization_samples: 1000
+  n_clusters: 8
