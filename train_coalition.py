@@ -307,8 +307,26 @@ def main():
     gen_metrics = evaluate(model, gen_loader, criterion, device)
     final_diag = diagnose_coalition(model, test_loader, device, n_batches=20)
 
+    # Inference speed
+    model.eval()
+    times = []
+    with torch.no_grad():
+        for i, (input_ids, _) in enumerate(test_loader):
+            if i >= 50:
+                break
+            input_ids = input_ids.to(device)
+            if device.type == 'cuda':
+                torch.cuda.synchronize()
+            t0 = time.time()
+            model(input_ids)
+            if device.type == 'cuda':
+                torch.cuda.synchronize()
+            times.append((time.time() - t0) * 1000 / input_ids.size(0))
+    inference_ms = sum(times) / len(times) if times else 0.0
+
     print(f'  Test Accuracy (in-dist):     {test_metrics["accuracy"]:.4f}')
     print(f'  Test Accuracy (generalize):  {gen_metrics["accuracy"]:.4f}')
+    print(f'  Inference Speed:             {inference_ms:.3f} ms/example')
     print(f'  Avg Coalition Size:          {final_diag.get("coalition_size_mean", 0):.1f}')
     print(f'  Coalition Size Std:          {final_diag.get("coalition_size_std", 0):.2f}')
     print(f'  Node Freq Std:               {final_diag.get("node_freq_std", 0):.4f}')
@@ -352,6 +370,8 @@ def main():
         'test_metrics': test_metrics,
         'gen_metrics': gen_metrics,
         'final_diagnostics': final_diag,
+        'inference_ms': inference_ms,
+        'n_params': model.count_parameters(),
     }, 'results/coalition/final.pt')
 
     with open('results/coalition/training_log.json', 'w') as f:

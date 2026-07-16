@@ -57,6 +57,7 @@ The task tests whether different node coalitions emerge for structurally differe
 │       └── visualize.py          # Heatmaps, position plots, graph structure
 ├── configs/experiment.yaml       # All hyperparameters
 ├── train_coalition.py            # Training script with coalition diagnostics
+├── train_baselines.py            # Dense + MoE baseline training
 └── notebooks/run_experiment.ipynb # Full experiment pipeline (Colab-ready)
 ```
 
