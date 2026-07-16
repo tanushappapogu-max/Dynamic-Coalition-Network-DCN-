@@ -153,14 +153,14 @@ def plot_graph_structure(patterns: list[dict], edge_weights: np.ndarray, save_pa
     node_colors = [type_colors.get(node_dominant_type[i], '#999') for i in range(n_nodes)]
     node_sizes = [activations[:, i].mean() * 2000 + 200 for i in range(n_nodes)]
 
-    nx.draw_nodes(G, pos, ax=ax, node_color=node_colors, node_size=node_sizes, alpha=0.8)
-    nx.draw_labels(G, pos, ax=ax, font_size=10, font_weight='bold')
+    nx.draw_networkx_nodes(G, pos, ax=ax, node_color=node_colors, node_size=node_sizes, alpha=0.8)
+    nx.draw_networkx_labels(G, pos, ax=ax, font_size=10, font_weight='bold')
 
     edges = G.edges(data=True)
     if edges:
         weights = [d['weight'] for _, _, d in edges]
-        nx.draw_edges(G, pos, ax=ax, edge_color='gray', width=[w * 3 for w in weights],
-                      alpha=0.5, arrows=True, arrowsize=15)
+        nx.draw_networkx_edges(G, pos, ax=ax, edge_color='gray', width=[w * 3 for w in weights],
+                               alpha=0.5, arrows=True, arrowsize=15)
 
     legend_elements = [plt.Line2D([0], [0], marker='o', color='w', markerfacecolor=c, markersize=12, label=t)
                        for t, c in type_colors.items()]

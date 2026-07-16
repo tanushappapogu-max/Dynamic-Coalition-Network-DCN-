@@ -77,21 +77,6 @@ def compute_active_params(model: nn.Module, loader: DataLoader, device: torch.de
     total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
 
     if not isinstance(model, CoalitionModel):
-        has_moe = any(hasattr(layer.ffn, 'gate') for layer in model.layers)
-        if has_moe:
-            moe_layer = next(l.ffn for l in model.layers if hasattr(l.ffn, 'gate'))
-            n_experts = moe_layer.n_experts
-            top_k = moe_layer.top_k
-            expert_params = sum(p.numel() for p in moe_layer.experts[0].parameters())
-            ffn_total = sum(p.numel() for p in moe_layer.parameters())
-            active_ffn = expert_params * top_k + sum(p.numel() for p in moe_layer.gate.parameters())
-            ratio = active_ffn / ffn_total
-            return {
-                'total_params': total_params,
-                'active_ratio': ratio,
-                'active_params_est': int(total_params * ratio),
-                'type': 'moe',
-            }
         return {'total_params': total_params, 'active_ratio': 1.0, 'active_params_est': total_params, 'type': 'dense'}
 
     activation_sums = []

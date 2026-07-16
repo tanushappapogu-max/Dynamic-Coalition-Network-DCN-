@@ -23,15 +23,16 @@ class CoalitionGraphFFN(nn.Module):
             for _ in range(n_nodes)
         ])
 
-        # Keys for seed selection — initialized with proper scale
+        # Keys for seed selection
         self.keys = nn.Parameter(torch.randn(n_nodes, d_model) / math.sqrt(d_model))
 
-        # Edge weights for recruitment — init negative so most edges start weak
-        # sigmoid(-2) ≈ 0.12, so initial recruitment signal is low
-        self.edge_logits = nn.Parameter(torch.randn(n_nodes, n_nodes) * 0.5 - 2.0)
+        # Edge weights for recruitment — raw learned weights, NO sigmoid wrapper
+        # Initialized so a few edges start strong enough to recruit
+        self.edge_weights = nn.Parameter(torch.randn(n_nodes, n_nodes) * 0.3)
 
-        # Recruitment threshold — start above typical recruit_signal so nodes must earn recruitment
-        self.recruit_threshold = nn.Parameter(torch.tensor(0.5))
+        # Bias per node for recruitment — start positive so recruitment is active early
+        # The model learns to suppress recruitment where it's not useful
+        self.recruit_bias = nn.Parameter(torch.ones(n_nodes) * 0.5)
 
         self._temperature = 1.0
 
@@ -43,60 +44,64 @@ class CoalitionGraphFFN(nn.Module):
     def temperature(self, val):
         self._temperature = max(val, 0.1)
 
+    def _get_routing_params(self):
+        return [self.keys, self.edge_weights, self.recruit_bias]
+
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, dict]:
         batch, seq_len, d_model = x.shape
-
-        # Seed selection: use sequence-pooled representation to pick which nodes activate
-        x_pooled = x.mean(dim=1)  # (batch, d_model)
-        seed_scores = x_pooled @ self.keys.T  # (batch, n_nodes)
-
-        # Top-k seed selection (always activates exactly n_seeds nodes)
-        # Soft version: use softmax over seed scores for differentiable weighting
         tau = self._temperature
 
-        # Hard top-k mask for seed activation
+        # === SEED SELECTION ===
+        # Pool sequence to get a routing vector
+        x_pooled = x.mean(dim=1)  # (batch, d_model)
+
+        # Score each node as a potential seed
+        seed_scores = x_pooled @ self.keys.T  # (batch, n_nodes)
+
+        # Soft seed weights via softmax (fully differentiable)
+        soft_seed_weights = F.softmax(seed_scores / tau, dim=-1)  # (batch, n_nodes)
+
+        # Hard top-k mask with straight-through gradient
         _, top_indices = seed_scores.topk(self.n_seeds, dim=-1)
         hard_seed_mask = torch.zeros_like(seed_scores)
         hard_seed_mask.scatter_(1, top_indices, 1.0)
 
-        # Soft seed scores (differentiable)
-        soft_seed_scores = F.softmax(seed_scores / tau, dim=-1)
+        # Straight-through: hard forward, soft backward
+        seed_activation = hard_seed_mask - soft_seed_weights.detach() + soft_seed_weights
 
-        # Straight-through: use hard mask in forward, soft scores in backward
-        seed_activation = hard_seed_mask + soft_seed_scores - soft_seed_scores.detach()
+        # === RECRUITMENT via attention-style scoring ===
+        # Mask self-connections
+        diag_mask = (1.0 - torch.eye(self.n_nodes, device=x.device))
+        masked_edges = self.edge_weights * diag_mask  # (n_nodes, n_nodes)
 
-        # Recruitment via learned edges
-        edge_weights = torch.sigmoid(self.edge_logits)
-        diag_mask = 1.0 - torch.eye(self.n_nodes, device=x.device)
-        edge_weights = edge_weights * diag_mask
+        # Each seed broadcasts its recruitment score to neighbors
+        # recruit_logits[b, j] = sum over seeds i: seed_activation[b,i] * edge_weights[i,j] + recruit_bias[j]
+        recruit_logits = seed_activation @ masked_edges + self.recruit_bias  # (batch, n_nodes)
 
-        # Recruitment signal: how strongly do active seeds recruit each node?
-        recruit_signal = seed_activation @ edge_weights  # (batch, n_nodes)
+        # Recruitment uses a warmer temperature floor — aggressive annealing kills recruitment
+        recruit_tau = max(tau, 0.5)
+        recruit_activation = torch.sigmoid(recruit_logits / recruit_tau)  # (batch, n_nodes)
 
-        # Soft recruitment threshold
-        recruit_activation = torch.sigmoid((recruit_signal - self.recruit_threshold) / tau)
+        # Zero out recruitment for nodes that are already seeds (they're already active)
+        recruit_activation = recruit_activation * (1.0 - hard_seed_mask)
 
-        # Final activation: seed OR recruited (soft-OR)
-        node_activation = seed_activation + recruit_activation - seed_activation * recruit_activation
+        # === COMBINE: seed + recruited ===
+        # Seeds get weight from softmax, recruited get weight from sigmoid
+        node_activation = seed_activation + recruit_activation  # (batch, n_nodes)
 
-        # Each node processes the full per-token input
-        # Stack all node outputs: (batch, n_nodes, seq_len, d_model)
-        node_outputs = torch.stack([node(x) for node in self.nodes], dim=1)
+        # === COMPUTE ===
+        node_outputs = torch.stack([node(x) for node in self.nodes], dim=1)  # (batch, n_nodes, seq_len, d_model)
 
-        # Weight by activation and sum across nodes
-        # node_activation: (batch, n_nodes) -> (batch, n_nodes, 1, 1)
-        weights = node_activation.unsqueeze(-1).unsqueeze(-1)
-        weighted = (weights * node_outputs).sum(dim=1)  # (batch, seq_len, d_model)
-
-        # Normalize by total activation
-        activation_sum = node_activation.sum(dim=1, keepdim=True).unsqueeze(-1).clamp(min=1e-6)
-        output = weighted / activation_sum  # (batch, seq_len, d_model)
+        # Normalize by n_seeds (fixed) so recruited nodes ADD value without diluting seeds
+        norm_weights = node_activation / self.n_seeds
+        output = (norm_weights.unsqueeze(-1).unsqueeze(-1) * node_outputs).sum(dim=1)
 
         aux_data = {
             'node_activation': node_activation,
             'seed_activation': seed_activation,
             'recruit_activation': recruit_activation,
-            'edge_weights': edge_weights.detach(),
+            'edge_weights': masked_edges.detach(),
+            'recruit_logits': recruit_logits.detach(),
             'seed_scores': seed_scores.detach(),
             'type': 'coalition',
         }
@@ -112,6 +117,19 @@ class CoalitionModel(BaseModel):
 
         super().__init__(config, ffn_factory)
         self.coalition_config = cc
+
+    def get_routing_params(self):
+        """Return all routing-specific parameters for separate LR group."""
+        routing_params = []
+        for layer in self.layers:
+            if isinstance(layer.ffn, CoalitionGraphFFN):
+                routing_params.extend(layer.ffn._get_routing_params())
+        return routing_params
+
+    def get_nonrouting_params(self):
+        """Return all non-routing parameters."""
+        routing_ids = {id(p) for p in self.get_routing_params()}
+        return [p for p in self.parameters() if id(p) not in routing_ids]
 
     def set_temperature(self, temperature: float):
         for layer in self.layers:

@@ -5,7 +5,7 @@ Logs coalition-specific diagnostics every epoch so we can spot problems early:
   - Average coalition size (too big? too small?)
   - Edge weight statistics (are edges learning anything?)
   - Temperature schedule
-  - Gradient norms on edge_logits and keys
+  - Gradient norms on routing params (keys, edge_weights, recruit_bias)
 """
 
 import os
@@ -24,7 +24,6 @@ from src.training.losses import coalition_load_balance_loss, coalition_size_loss
 
 
 def diagnose_coalition(model, loader, device, n_batches=5):
-    """Run a few batches and collect detailed coalition diagnostics."""
     model.eval()
     all_activations = []
     all_seed_acts = []
@@ -37,7 +36,6 @@ def diagnose_coalition(model, loader, device, n_batches=5):
             input_ids = input_ids.to(device)
             result = model(input_ids)
             if 'aux_data' in result:
-                # Use first layer's data
                 aux = result['aux_data'][0]
                 all_activations.append(aux['node_activation'].cpu())
                 all_seed_acts.append(aux['seed_activation'].cpu())
@@ -50,17 +48,14 @@ def diagnose_coalition(model, loader, device, n_batches=5):
     seed_acts = torch.cat(all_seed_acts, dim=0)
     recruit_acts = torch.cat(all_recruit_acts, dim=0)
 
-    # Per-node activation frequency
     node_freq = activations.mean(dim=0)
-
-    # Coalition sizes
     coalition_sizes = (activations > 0.5).float().sum(dim=1)
 
-    # Edge weight stats from first coalition layer
-    edge_weights = None
+    # Get edge weights from first coalition layer (raw weights now, no sigmoid)
+    edge_w = None
     for layer in model.layers:
-        if hasattr(layer.ffn, 'edge_logits'):
-            edge_weights = torch.sigmoid(layer.ffn.edge_logits).detach().cpu()
+        if hasattr(layer.ffn, 'edge_weights'):
+            edge_w = layer.ffn.edge_weights.detach().cpu()
             break
 
     diag = {
@@ -78,23 +73,23 @@ def diagnose_coalition(model, loader, device, n_batches=5):
         'temperature': model.get_temperature(),
     }
 
-    if edge_weights is not None:
-        mask = 1.0 - torch.eye(edge_weights.shape[0])
-        ew = edge_weights * mask
-        diag['edge_weight_mean'] = ew.sum().item() / mask.sum().item()
+    if edge_w is not None:
+        mask = 1.0 - torch.eye(edge_w.shape[0])
+        ew = edge_w * mask
+        ew_abs = ew.abs()
+        diag['edge_weight_mean'] = ew.mean().item()
         diag['edge_weight_std'] = ew[mask.bool()].std().item()
-        diag['edge_weight_max'] = ew.max().item()
-        diag['n_strong_edges'] = (ew > 0.7).sum().item()
-        diag['n_weak_edges'] = (ew < 0.3).sum().item()
+        diag['edge_weight_absmax'] = ew_abs.max().item()
+        diag['n_strong_edges'] = (ew_abs > 0.5).sum().item()
+        diag['n_weak_edges'] = (ew_abs < 0.1).sum().item()
 
     return diag
 
 
 def get_grad_norms(model):
-    """Get gradient norms for coalition-specific parameters."""
     norms = {}
     for name, param in model.named_parameters():
-        if param.grad is not None and ('edge_logits' in name or 'keys' in name or 'threshold' in name):
+        if param.grad is not None and ('edge_weights' in name or 'keys' in name or 'recruit_bias' in name):
             norms[name] = param.grad.norm().item()
     return norms
 
@@ -184,7 +179,6 @@ def main():
     with open('configs/experiment.yaml') as f:
         config = yaml.safe_load(f)
 
-    # Check for --small flag for quick local testing
     small_mode = '--small' in sys.argv
     if small_mode:
         print('=== SMALL MODE: reduced dataset for quick testing ===')
@@ -216,8 +210,23 @@ def main():
     print(f'\nCoalition model: {model.count_parameters():,} parameters')
 
     tc = config['training']
-    optimizer = torch.optim.AdamW(model.parameters(), lr=tc['learning_rate'], weight_decay=tc['weight_decay'])
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=tc['epochs'], eta_min=tc['learning_rate'] * 0.1)
+
+    # SEPARATE LEARNING RATES: routing params get 10x higher LR
+    routing_params = model.get_routing_params()
+    nonrouting_params = model.get_nonrouting_params()
+    routing_lr = tc['learning_rate'] * 10  # 3e-3 vs 3e-4
+
+    print(f'Routing params: {sum(p.numel() for p in routing_params):,} (lr={routing_lr})')
+    print(f'Other params:   {sum(p.numel() for p in nonrouting_params):,} (lr={tc["learning_rate"]})')
+
+    optimizer = torch.optim.AdamW([
+        {'params': nonrouting_params, 'lr': tc['learning_rate']},
+        {'params': routing_params, 'lr': routing_lr},
+    ], weight_decay=tc['weight_decay'])
+
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=tc['epochs'], eta_min=tc['learning_rate'] * 0.1
+    )
     criterion = nn.CrossEntropyLoss(ignore_index=PAD_IDX)
 
     os.makedirs('results/coalition', exist_ok=True)
@@ -230,23 +239,16 @@ def main():
     for epoch in range(tc['epochs']):
         start = time.time()
 
-        # Update temperature
         temp = model.compute_temperature(epoch, tc['epochs'])
         model.set_temperature(temp)
 
-        # Train
         train_metrics = train_one_epoch(model, train_loader, optimizer, criterion, config, device, tc['grad_clip'])
-
-        # Validate
         val_metrics = evaluate(model, val_loader, criterion, device)
-
-        # Coalition diagnostics
         diag = diagnose_coalition(model, val_loader, device)
 
         scheduler.step()
         elapsed = time.time() - start
 
-        # Log entry
         entry = {
             'epoch': epoch + 1,
             'elapsed': elapsed,
@@ -257,7 +259,6 @@ def main():
         }
         log.append(entry)
 
-        # Print
         coal_sz = diag.get('coalition_size_mean', 0)
         node_std = diag.get('node_freq_std', 0)
         strong_e = diag.get('n_strong_edges', 0)
@@ -275,7 +276,6 @@ def main():
             f'{strong_e:>8}'
         )
 
-        # Detailed print every 5 epochs
         if (epoch + 1) % 5 == 0:
             print(f'  Node freqs: [{", ".join(f"{f:.2f}" for f in diag.get("node_freqs", []))}]')
             if train_metrics.get('grad_norms'):
@@ -284,7 +284,6 @@ def main():
                     print(f'  Grad {short}: {norm:.6f}')
             print()
 
-        # Save checkpoint every 10 epochs
         if (epoch + 1) % 10 == 0:
             torch.save({
                 'epoch': epoch + 1,
@@ -307,10 +306,10 @@ def main():
     print(f'  Avg Coalition Size:          {final_diag.get("coalition_size_mean", 0):.1f}')
     print(f'  Coalition Size Std:          {final_diag.get("coalition_size_std", 0):.2f}')
     print(f'  Node Freq Std:               {final_diag.get("node_freq_std", 0):.4f}')
-    print(f'  Strong Edges (>0.7):         {final_diag.get("n_strong_edges", 0)}')
+    print(f'  Strong Edges (>0.5):         {final_diag.get("n_strong_edges", 0)}')
     print(f'  Edge Weight Mean:            {final_diag.get("edge_weight_mean", 0):.4f}')
+    print(f'  Edge Weight AbsMax:          {final_diag.get("edge_weight_absmax", 0):.4f}')
 
-    # Warnings
     print('\n--- HEALTH CHECK ---')
     coal_sz = final_diag.get('coalition_size_mean', 0)
     if coal_sz > 14:
@@ -330,7 +329,15 @@ def main():
     if strong == 0:
         print(f'  WARNING: No strong edges learned. Recruitment may not be working.')
     else:
-        print(f'  OK: {strong} strong edges (>0.7) learned')
+        print(f'  OK: {strong} strong edges (>0.5) learned')
+
+    recruit_mean = final_diag.get('recruit_activation_mean', 0)
+    if recruit_mean < 0.01:
+        print(f'  WARNING: Recruitment almost never fires (mean={recruit_mean:.4f})')
+    elif recruit_mean > 0.8:
+        print(f'  WARNING: Recruitment fires too often (mean={recruit_mean:.4f})')
+    else:
+        print(f'  OK: Recruitment activation mean {recruit_mean:.4f}')
 
     # Save everything
     torch.save({
