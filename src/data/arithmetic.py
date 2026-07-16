@@ -78,15 +78,39 @@ def generate_dataset(
     max_nesting: int,
     seed: int = 42,
     exclude: Optional[set[str]] = None,
+    balanced: bool = True,
 ) -> list[tuple[str, str]]:
     rng_state = random.getstate()
     random.seed(seed)
 
     exclude = exclude or set()
-    data = []
     seen = set()
 
-    while len(data) < size:
+    if not balanced:
+        data = []
+        while len(data) < size:
+            num_ops = random.randint(num_ops_range[0], num_ops_range[1])
+            result = generate_expression(num_ops, max_nesting)
+            if result is None:
+                continue
+            expr, val = result
+            if expr in seen or expr in exclude:
+                continue
+            seen.add(expr)
+            data.append((expr, str(val)))
+        random.setstate(rng_state)
+        return data
+
+    types = ['add_sub_only', 'mul_div_only', 'mixed_precedence', 'parenthesized']
+    per_type = size // len(types)
+    remainder = size - per_type * len(types)
+    buckets = {t: [] for t in types}
+    targets = {t: per_type + (1 if i < remainder else 0) for i, t in enumerate(types)}
+
+    attempts = 0
+    max_attempts = size * 50
+    while any(len(buckets[t]) < targets[t] for t in types) and attempts < max_attempts:
+        attempts += 1
         num_ops = random.randint(num_ops_range[0], num_ops_range[1])
         result = generate_expression(num_ops, max_nesting)
         if result is None:
@@ -94,8 +118,15 @@ def generate_dataset(
         expr, val = result
         if expr in seen or expr in exclude:
             continue
-        seen.add(expr)
-        data.append((expr, str(val)))
+        etype = classify_expression(expr)
+        if len(buckets[etype]) < targets[etype]:
+            seen.add(expr)
+            buckets[etype].append((expr, str(val)))
+
+    data = []
+    for t in types:
+        data.extend(buckets[t])
+    random.shuffle(data)
 
     random.setstate(rng_state)
     return data

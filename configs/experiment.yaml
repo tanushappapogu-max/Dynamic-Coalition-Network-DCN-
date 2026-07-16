@@ -38,8 +38,8 @@ coalition:
   temp_end: 0.1
   warmup_fraction: 0.1
   balance_coef: 0.01
-  size_coef: 0.001
-  target_coalition_size: 6
+  size_coef: 0.01
+  target_coalition_size: 7
 
 training:
   batch_size: 128

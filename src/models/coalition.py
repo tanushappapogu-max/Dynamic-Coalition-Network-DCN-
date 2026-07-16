@@ -33,7 +33,6 @@ class CoalitionGraphFFN(nn.Module):
         pos_init = pos_init / pos_init.norm(dim=1, keepdim=True)
         self.positions = nn.Parameter(pos_init)
 
-        # Recruitment threshold — how close a neighbor must be to get recruited
         self.recruit_threshold = nn.Parameter(torch.tensor(0.0))
 
         self._temperature = 1.0

@@ -23,3 +23,8 @@ def coalition_load_balance_loss(node_activation: torch.Tensor) -> torch.Tensor:
 def coalition_size_loss(node_activation: torch.Tensor, target_size: float) -> torch.Tensor:
     avg_size = node_activation.sum(dim=1).mean()
     return (avg_size - target_size) ** 2
+
+
+def recruitment_encouragement_loss(recruit_activation: torch.Tensor) -> torch.Tensor:
+    avg_recruit = recruit_activation.mean()
+    return torch.clamp(0.1 - avg_recruit, min=0.0) ** 2

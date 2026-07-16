@@ -20,7 +20,7 @@ from torch.utils.data import DataLoader
 
 from src.data.arithmetic import create_datasets, PAD_IDX, decode_output, classify_expression
 from src.models.coalition import CoalitionModel
-from src.training.losses import coalition_load_balance_loss, coalition_size_loss
+from src.training.losses import coalition_load_balance_loss, coalition_size_loss, recruitment_encouragement_loss
 
 
 def diagnose_coalition(model, loader, device, n_batches=5):
@@ -118,7 +118,8 @@ def train_one_epoch(model, loader, optimizer, criterion, config, device, grad_cl
                 if aux['type'] == 'coalition':
                     bal = coalition_load_balance_loss(aux['node_activation'])
                     sz = coalition_size_loss(aux['node_activation'], cc['target_coalition_size'])
-                    aux_loss = aux_loss + cc['balance_coef'] * bal + cc['size_coef'] * sz
+                    rec = recruitment_encouragement_loss(aux['recruit_activation'])
+                    aux_loss = aux_loss + cc['balance_coef'] * bal + cc['size_coef'] * sz + 0.01 * rec
 
         loss = task_loss + aux_loss
 
