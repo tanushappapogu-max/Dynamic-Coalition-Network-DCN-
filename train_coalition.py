@@ -1,11 +1,11 @@
 """
 Focused training script for the Coalition-Graph model only.
-Logs coalition-specific diagnostics every epoch so we can spot problems early:
+Logs coalition-specific diagnostics every epoch:
   - Per-node activation frequency (routing collapse?)
   - Average coalition size (too big? too small?)
-  - Edge weight statistics (are edges learning anything?)
+  - Node position clustering (are nodes self-organizing?)
   - Temperature schedule
-  - Gradient norms on routing params (keys, edge_weights, recruit_bias)
+  - Gradient norms on routing params (keys, positions, recruit_threshold)
 """
 
 import os
@@ -51,13 +51,6 @@ def diagnose_coalition(model, loader, device, n_batches=5):
     node_freq = activations.mean(dim=0)
     coalition_sizes = (activations > 0.5).float().sum(dim=1)
 
-    # Get edge weights from first coalition layer (raw weights now, no sigmoid)
-    edge_w = None
-    for layer in model.layers:
-        if hasattr(layer.ffn, 'edge_weights'):
-            edge_w = layer.ffn.edge_weights.detach().cpu()
-            break
-
     diag = {
         'node_freq_mean': node_freq.mean().item(),
         'node_freq_std': node_freq.std().item(),
@@ -73,15 +66,21 @@ def diagnose_coalition(model, loader, device, n_batches=5):
         'temperature': model.get_temperature(),
     }
 
-    if edge_w is not None:
-        mask = 1.0 - torch.eye(edge_w.shape[0])
-        ew = edge_w * mask
-        ew_abs = ew.abs()
-        diag['edge_weight_mean'] = ew.mean().item()
-        diag['edge_weight_std'] = ew[mask.bool()].std().item()
-        diag['edge_weight_absmax'] = ew_abs.max().item()
-        diag['n_strong_edges'] = (ew_abs > 0.5).sum().item()
-        diag['n_weak_edges'] = (ew_abs < 0.1).sum().item()
+    # Position-based diagnostics
+    for layer in model.layers:
+        if hasattr(layer.ffn, 'positions'):
+            pos = layer.ffn.positions.detach().cpu()
+            pos_norm = pos / pos.norm(dim=1, keepdim=True)
+            sim = (pos_norm @ pos_norm.T)
+            mask = 1.0 - torch.eye(sim.shape[0])
+            off_diag = sim[mask.bool()]
+            diag['pos_sim_mean'] = off_diag.mean().item()
+            diag['pos_sim_std'] = off_diag.std().item()
+            diag['pos_sim_max'] = off_diag.max().item()
+            diag['pos_sim_min'] = off_diag.min().item()
+            n_close_pairs = (off_diag > 0.7).sum().item()
+            diag['n_close_pairs'] = n_close_pairs
+            break
 
     return diag
 
@@ -89,7 +88,7 @@ def diagnose_coalition(model, loader, device, n_batches=5):
 def get_grad_norms(model):
     norms = {}
     for name, param in model.named_parameters():
-        if param.grad is not None and ('edge_weights' in name or 'keys' in name or 'recruit_bias' in name):
+        if param.grad is not None and ('positions' in name or 'keys' in name or 'recruit_threshold' in name):
             norms[name] = param.grad.norm().item()
     return norms
 
@@ -186,7 +185,7 @@ def main():
         config['data']['val_size'] = 500
         config['data']['test_size'] = 500
         config['data']['gen_test_size'] = 200
-        config['training']['epochs'] = 15
+        config['training']['epochs'] = 20
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f'Device: {device}')
@@ -198,6 +197,12 @@ def main():
     datasets = create_datasets(config)
     for name, ds in datasets.items():
         print(f'  {name}: {len(ds)} examples')
+
+    # Show samples
+    print('\nSample expressions:')
+    for i in range(8):
+        expr, result = datasets['train'].data[i]
+        print(f'  {expr} = {result}  [{classify_expression(expr)}]')
 
     bs = config['training']['batch_size']
     train_loader = DataLoader(datasets['train'], batch_size=bs, shuffle=True, num_workers=0)
@@ -211,10 +216,9 @@ def main():
 
     tc = config['training']
 
-    # SEPARATE LEARNING RATES: routing params get 10x higher LR
     routing_params = model.get_routing_params()
     nonrouting_params = model.get_nonrouting_params()
-    routing_lr = tc['learning_rate'] * 10  # 3e-3 vs 3e-4
+    routing_lr = tc['learning_rate'] * 10
 
     print(f'Routing params: {sum(p.numel() for p in routing_params):,} (lr={routing_lr})')
     print(f'Other params:   {sum(p.numel() for p in nonrouting_params):,} (lr={tc["learning_rate"]})')
@@ -233,7 +237,7 @@ def main():
     log = []
 
     print(f'\nTraining for {tc["epochs"]} epochs...\n')
-    print(f'{"Epoch":>5} {"Loss":>8} {"Task":>8} {"Aux":>8} {"ValLoss":>8} {"ValAcc":>8} {"Temp":>6} {"CoalSz":>7} {"NodeStd":>8} {"StrongE":>8}')
+    print(f'{"Epoch":>5} {"Loss":>8} {"Task":>8} {"Aux":>8} {"ValLoss":>8} {"ValAcc":>8} {"Temp":>6} {"CoalSz":>7} {"NodeStd":>8} {"ClosePr":>8}')
     print('-' * 95)
 
     for epoch in range(tc['epochs']):
@@ -261,7 +265,7 @@ def main():
 
         coal_sz = diag.get('coalition_size_mean', 0)
         node_std = diag.get('node_freq_std', 0)
-        strong_e = diag.get('n_strong_edges', 0)
+        close_pr = diag.get('n_close_pairs', 0)
 
         print(
             f'{epoch+1:>5} '
@@ -273,11 +277,12 @@ def main():
             f'{temp:>6.3f} '
             f'{coal_sz:>7.1f} '
             f'{node_std:>8.4f} '
-            f'{strong_e:>8}'
+            f'{close_pr:>8}'
         )
 
         if (epoch + 1) % 5 == 0:
             print(f'  Node freqs: [{", ".join(f"{f:.2f}" for f in diag.get("node_freqs", []))}]')
+            print(f'  Position sim: mean={diag.get("pos_sim_mean", 0):.3f} std={diag.get("pos_sim_std", 0):.3f} max={diag.get("pos_sim_max", 0):.3f}')
             if train_metrics.get('grad_norms'):
                 for pname, norm in train_metrics['grad_norms'].items():
                     short = pname.split('.')[-1]
@@ -306,9 +311,9 @@ def main():
     print(f'  Avg Coalition Size:          {final_diag.get("coalition_size_mean", 0):.1f}')
     print(f'  Coalition Size Std:          {final_diag.get("coalition_size_std", 0):.2f}')
     print(f'  Node Freq Std:               {final_diag.get("node_freq_std", 0):.4f}')
-    print(f'  Strong Edges (>0.5):         {final_diag.get("n_strong_edges", 0)}')
-    print(f'  Edge Weight Mean:            {final_diag.get("edge_weight_mean", 0):.4f}')
-    print(f'  Edge Weight AbsMax:          {final_diag.get("edge_weight_absmax", 0):.4f}')
+    print(f'  Close Pairs (sim>0.7):       {final_diag.get("n_close_pairs", 0)}')
+    print(f'  Position Sim Mean:           {final_diag.get("pos_sim_mean", 0):.4f}')
+    print(f'  Recruit Mean:                {final_diag.get("recruit_activation_mean", 0):.4f}')
 
     print('\n--- HEALTH CHECK ---')
     coal_sz = final_diag.get('coalition_size_mean', 0)
@@ -325,11 +330,11 @@ def main():
     else:
         print(f'  OK: Node frequency std {node_std:.4f} — some differentiation')
 
-    strong = final_diag.get('n_strong_edges', 0)
-    if strong == 0:
-        print(f'  WARNING: No strong edges learned. Recruitment may not be working.')
+    close_pairs = final_diag.get('n_close_pairs', 0)
+    if close_pairs == 0:
+        print(f'  WARNING: No close node pairs (sim>0.7). Nodes not clustering.')
     else:
-        print(f'  OK: {strong} strong edges (>0.5) learned')
+        print(f'  OK: {close_pairs} close node pairs — clusters forming')
 
     recruit_mean = final_diag.get('recruit_activation_mean', 0)
     if recruit_mean < 0.01:

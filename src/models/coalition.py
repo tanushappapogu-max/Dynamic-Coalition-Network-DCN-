@@ -8,11 +8,12 @@ from src.models.shared import BaseModel
 
 
 class CoalitionGraphFFN(nn.Module):
-    def __init__(self, d_model: int, n_nodes: int, d_node: int, n_seeds: int):
+    def __init__(self, d_model: int, n_nodes: int, d_node: int, n_seeds: int, d_pos: int = 32):
         super().__init__()
         self.n_nodes = n_nodes
         self.d_model = d_model
         self.n_seeds = n_seeds
+        self.d_pos = d_pos
 
         self.nodes = nn.ModuleList([
             nn.Sequential(
@@ -23,16 +24,17 @@ class CoalitionGraphFFN(nn.Module):
             for _ in range(n_nodes)
         ])
 
-        # Keys for seed selection
+        # Keys for seed selection (input-dependent: "what task is this?")
         self.keys = nn.Parameter(torch.randn(n_nodes, d_model) / math.sqrt(d_model))
 
-        # Edge weights for recruitment — raw learned weights, NO sigmoid wrapper
-        # Initialized so a few edges start strong enough to recruit
-        self.edge_weights = nn.Parameter(torch.randn(n_nodes, n_nodes) * 0.3)
+        # Node positions in learned embedding space (proximity = affinity)
+        # Initialized on a unit sphere so distances are meaningful from the start
+        pos_init = torch.randn(n_nodes, d_pos)
+        pos_init = pos_init / pos_init.norm(dim=1, keepdim=True)
+        self.positions = nn.Parameter(pos_init)
 
-        # Bias per node for recruitment — start positive so recruitment is active early
-        # The model learns to suppress recruitment where it's not useful
-        self.recruit_bias = nn.Parameter(torch.ones(n_nodes) * 0.5)
+        # Recruitment threshold — how close a neighbor must be to get recruited
+        self.recruit_threshold = nn.Parameter(torch.tensor(0.0))
 
         self._temperature = 1.0
 
@@ -45,54 +47,46 @@ class CoalitionGraphFFN(nn.Module):
         self._temperature = max(val, 0.1)
 
     def _get_routing_params(self):
-        return [self.keys, self.edge_weights, self.recruit_bias]
+        return [self.keys, self.positions, self.recruit_threshold]
 
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, dict]:
         batch, seq_len, d_model = x.shape
         tau = self._temperature
 
-        # === SEED SELECTION ===
-        # Pool sequence to get a routing vector
+        # === SEED SELECTION (input-dependent) ===
         x_pooled = x.mean(dim=1)  # (batch, d_model)
-
-        # Score each node as a potential seed
         seed_scores = x_pooled @ self.keys.T  # (batch, n_nodes)
 
-        # Soft seed weights via softmax (fully differentiable)
-        soft_seed_weights = F.softmax(seed_scores / tau, dim=-1)  # (batch, n_nodes)
-
-        # Hard top-k mask with straight-through gradient
+        soft_seed_weights = F.softmax(seed_scores / tau, dim=-1)
         _, top_indices = seed_scores.topk(self.n_seeds, dim=-1)
         hard_seed_mask = torch.zeros_like(seed_scores)
         hard_seed_mask.scatter_(1, top_indices, 1.0)
-
-        # Straight-through: hard forward, soft backward
         seed_activation = hard_seed_mask - soft_seed_weights.detach() + soft_seed_weights
 
-        # === RECRUITMENT via attention-style scoring ===
-        # Mask self-connections
-        diag_mask = (1.0 - torch.eye(self.n_nodes, device=x.device))
-        masked_edges = self.edge_weights * diag_mask  # (n_nodes, n_nodes)
+        # === RECRUITMENT via position proximity ===
+        # Compute pairwise similarity between all node positions
+        pos_norm = F.normalize(self.positions, dim=1)  # (n_nodes, d_pos)
+        similarity = pos_norm @ pos_norm.T  # (n_nodes, n_nodes), range [-1, 1]
 
-        # Each seed broadcasts its recruitment score to neighbors
-        # recruit_logits[b, j] = sum over seeds i: seed_activation[b,i] * edge_weights[i,j] + recruit_bias[j]
-        recruit_logits = seed_activation @ masked_edges + self.recruit_bias  # (batch, n_nodes)
+        # For each batch element, compute how close each node is to the active seeds
+        # seed_activation: (batch, n_nodes), similarity: (n_nodes, n_nodes)
+        # proximity[b, j] = sum_i seed_activation[b, i] * similarity[i, j]
+        proximity = seed_activation @ similarity  # (batch, n_nodes)
 
-        # Recruitment uses a warmer temperature floor — aggressive annealing kills recruitment
+        # Subtract self-proximity (seeds shouldn't recruit themselves)
+        proximity = proximity - seed_activation * 1.0  # remove self-similarity contribution
+
         recruit_tau = max(tau, 0.5)
-        recruit_activation = torch.sigmoid(recruit_logits / recruit_tau)  # (batch, n_nodes)
-
-        # Zero out recruitment for nodes that are already seeds (they're already active)
+        recruit_activation = torch.sigmoid((proximity - self.recruit_threshold) / recruit_tau)
         recruit_activation = recruit_activation * (1.0 - hard_seed_mask)
 
-        # === COMBINE: seed + recruited ===
-        # Seeds get weight from softmax, recruited get weight from sigmoid
-        node_activation = seed_activation + recruit_activation  # (batch, n_nodes)
+        # === COMBINE ===
+        node_activation = seed_activation + recruit_activation
 
         # === COMPUTE ===
-        node_outputs = torch.stack([node(x) for node in self.nodes], dim=1)  # (batch, n_nodes, seq_len, d_model)
+        node_outputs = torch.stack([node(x) for node in self.nodes], dim=1)
 
-        # Normalize by n_seeds (fixed) so recruited nodes ADD value without diluting seeds
+        # Normalize by n_seeds so recruited nodes add value on top
         norm_weights = node_activation / self.n_seeds
         output = (norm_weights.unsqueeze(-1).unsqueeze(-1) * node_outputs).sum(dim=1)
 
@@ -100,8 +94,9 @@ class CoalitionGraphFFN(nn.Module):
             'node_activation': node_activation,
             'seed_activation': seed_activation,
             'recruit_activation': recruit_activation,
-            'edge_weights': masked_edges.detach(),
-            'recruit_logits': recruit_logits.detach(),
+            'proximity': proximity.detach(),
+            'similarity_matrix': similarity.detach(),
+            'positions': self.positions.detach(),
             'seed_scores': seed_scores.detach(),
             'type': 'coalition',
         }
@@ -113,13 +108,15 @@ class CoalitionModel(BaseModel):
         cc = config['coalition']
 
         def ffn_factory(d_model):
-            return CoalitionGraphFFN(d_model, cc['n_nodes'], cc['d_node'], cc['n_seeds'])
+            return CoalitionGraphFFN(
+                d_model, cc['n_nodes'], cc['d_node'], cc['n_seeds'],
+                d_pos=cc.get('d_pos', 32),
+            )
 
         super().__init__(config, ffn_factory)
         self.coalition_config = cc
 
     def get_routing_params(self):
-        """Return all routing-specific parameters for separate LR group."""
         routing_params = []
         for layer in self.layers:
             if isinstance(layer.ffn, CoalitionGraphFFN):
@@ -127,7 +124,6 @@ class CoalitionModel(BaseModel):
         return routing_params
 
     def get_nonrouting_params(self):
-        """Return all non-routing parameters."""
         routing_ids = {id(p) for p in self.get_routing_params()}
         return [p for p in self.parameters() if id(p) not in routing_ids]
 

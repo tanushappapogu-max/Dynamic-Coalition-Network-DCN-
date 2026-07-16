@@ -3,22 +3,22 @@ data:
   val_size: 10000
   test_size: 10000
   gen_test_size: 5000
-  train_num_ops: [2, 5]
-  train_max_nesting: 2
-  gen_num_ops: [6, 9]
-  gen_max_nesting: 4
-  max_input_len: 64
-  max_output_len: 5
+  train_num_ops: [2, 3]
+  train_max_nesting: 1
+  gen_num_ops: [4, 5]
+  gen_max_nesting: 2
+  max_input_len: 32
+  max_output_len: 4
   seed: 42
 
 model:
-  d_model: 128
+  d_model: 256
   n_layers: 4
   n_heads: 4
   dropout: 0.1
   vocab_size: 20
-  max_seq_len: 64
-  max_output_len: 5
+  max_seq_len: 32
+  max_output_len: 4
 
 dense:
   d_ffn: 1024
@@ -33,6 +33,7 @@ coalition:
   n_nodes: 16
   d_node: 64
   n_seeds: 4
+  d_pos: 32
   temp_start: 1.0
   temp_end: 0.1
   warmup_fraction: 0.1

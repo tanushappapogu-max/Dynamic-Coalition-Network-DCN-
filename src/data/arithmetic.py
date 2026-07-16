@@ -22,7 +22,7 @@ OPS = ['+', '-', '*', '/']
 
 
 def _random_operand():
-    return str(random.randint(1, 99))
+    return str(random.randint(1, 9))
 
 
 def _generate_expr(num_ops: int, max_nesting: int, _depth: int = 0) -> str:
@@ -56,7 +56,7 @@ def _safe_eval(expr: str) -> Optional[int]:
         if isinstance(result, float) and result != int(result):
             return None
         result = int(result)
-        if abs(result) > 9999:
+        if abs(result) > 999:
             return None
         return result
     except (ZeroDivisionError, SyntaxError, OverflowError):

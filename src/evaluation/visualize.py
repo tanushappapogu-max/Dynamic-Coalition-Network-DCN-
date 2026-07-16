@@ -112,14 +112,87 @@ def plot_activation_heatmap(patterns: list[dict], layer_idx: int = 0, save_path:
     print(f"Saved activation heatmap to {save_path}")
 
 
-def plot_graph_structure(patterns: list[dict], edge_weights: np.ndarray, save_path: str = 'graph_structure.png'):
+def plot_node_positions(positions: np.ndarray, patterns: list[dict], layer_idx: int = 0,
+                        save_path: str = 'node_positions.png'):
+    """Visualize node positions in 2D using PCA, colored by dominant expression type."""
+    from sklearn.decomposition import PCA
+
+    n_nodes = positions.shape[0]
+    type_colors = {
+        'add_sub_only': '#2196F3',
+        'mul_div_only': '#FF9800',
+        'mixed_precedence': '#4CAF50',
+        'parenthesized': '#E91E63',
+    }
+
+    activations = np.array([p['activations'][layer_idx] for p in patterns if len(p['activations']) > layer_idx])
+    type_labels = [p['expr_type'] for p in patterns if len(p['activations']) > layer_idx]
+    types = list(set(type_labels))
+
+    # Find dominant type per node
+    node_dominant_type = []
+    node_pref_score = []
+    for node_idx in range(n_nodes):
+        type_scores = {t: 0.0 for t in types}
+        for i, t in enumerate(type_labels):
+            type_scores[t] += activations[i, node_idx]
+        for t in type_scores:
+            type_scores[t] /= max(sum(1 for l in type_labels if l == t), 1)
+        dominant = max(type_scores, key=type_scores.get)
+        node_dominant_type.append(dominant)
+        others = [v for t, v in type_scores.items() if t != dominant]
+        node_pref_score.append(type_scores[dominant] - (sum(others) / max(len(others), 1)))
+
+    # PCA to 2D
+    if positions.shape[1] > 2:
+        pca = PCA(n_components=2)
+        pos_2d = pca.fit_transform(positions)
+    else:
+        pos_2d = positions
+
+    fig, ax = plt.subplots(figsize=(10, 10))
+
+    # Draw lines between close nodes (similarity > 0.5)
+    pos_norm = positions / np.linalg.norm(positions, axis=1, keepdims=True)
+    sim = pos_norm @ pos_norm.T
+    for i in range(n_nodes):
+        for j in range(i + 1, n_nodes):
+            if sim[i, j] > 0.5:
+                alpha = min((sim[i, j] - 0.5) * 4, 1.0)
+                ax.plot([pos_2d[i, 0], pos_2d[j, 0]], [pos_2d[i, 1], pos_2d[j, 1]],
+                        'gray', alpha=alpha * 0.5, linewidth=sim[i, j] * 3)
+
+    # Draw nodes
+    for i in range(n_nodes):
+        color = type_colors.get(node_dominant_type[i], '#999')
+        size = activations[:, i].mean() * 1500 + 200
+        ax.scatter(pos_2d[i, 0], pos_2d[i, 1], c=color, s=size, alpha=0.8,
+                   edgecolors='black', linewidth=1.5, zorder=5)
+        ax.annotate(str(i), (pos_2d[i, 0], pos_2d[i, 1]), ha='center', va='center',
+                    fontweight='bold', fontsize=10, zorder=6)
+
+    legend_elements = [plt.Line2D([0], [0], marker='o', color='w', markerfacecolor=c,
+                                   markersize=12, label=t)
+                       for t, c in type_colors.items()]
+    ax.legend(handles=legend_elements, loc='upper left', title='Dominant Type')
+    ax.set_title('Node Positions in Learned Embedding Space\n(size = avg activation, lines = similarity > 0.5)')
+    ax.grid(True, alpha=0.2)
+
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=150, bbox_inches='tight')
+    plt.close()
+    print(f"Saved node positions to {save_path}")
+
+
+def plot_graph_structure(patterns: list[dict], similarity_matrix: np.ndarray,
+                         save_path: str = 'graph_structure.png'):
     try:
         import networkx as nx
     except ImportError:
         print("networkx not installed, skipping graph visualization")
         return
 
-    n_nodes = edge_weights.shape[0]
+    n_nodes = similarity_matrix.shape[0]
     activations = np.array([p['activations'][0] for p in patterns if len(p['activations']) > 0])
 
     if len(activations) == 0:
@@ -127,7 +200,8 @@ def plot_graph_structure(patterns: list[dict], edge_weights: np.ndarray, save_pa
 
     type_labels = [p['expr_type'] for p in patterns if len(p['activations']) > 0]
     types = list(set(type_labels))
-    type_colors = {'add_sub_only': '#2196F3', 'mul_div_only': '#FF9800', 'mixed_precedence': '#4CAF50', 'parenthesized': '#E91E63'}
+    type_colors = {'add_sub_only': '#2196F3', 'mul_div_only': '#FF9800',
+                   'mixed_precedence': '#4CAF50', 'parenthesized': '#E91E63'}
 
     node_dominant_type = []
     for node_idx in range(n_nodes):
@@ -137,15 +211,15 @@ def plot_graph_structure(patterns: list[dict], edge_weights: np.ndarray, save_pa
         dominant = max(type_scores, key=type_scores.get)
         node_dominant_type.append(dominant)
 
-    G = nx.DiGraph()
+    G = nx.Graph()
     for i in range(n_nodes):
         G.add_node(i)
 
-    threshold = 0.3
+    threshold = 0.5
     for i in range(n_nodes):
-        for j in range(n_nodes):
-            if i != j and edge_weights[i, j] > threshold:
-                G.add_edge(i, j, weight=edge_weights[i, j])
+        for j in range(i + 1, n_nodes):
+            if similarity_matrix[i, j] > threshold:
+                G.add_edge(i, j, weight=similarity_matrix[i, j])
 
     fig, ax = plt.subplots(figsize=(12, 10))
     pos = nx.spring_layout(G, k=2, seed=42)
@@ -160,12 +234,12 @@ def plot_graph_structure(patterns: list[dict], edge_weights: np.ndarray, save_pa
     if edges:
         weights = [d['weight'] for _, _, d in edges]
         nx.draw_networkx_edges(G, pos, ax=ax, edge_color='gray', width=[w * 3 for w in weights],
-                               alpha=0.5, arrows=True, arrowsize=15)
+                               alpha=0.5)
 
     legend_elements = [plt.Line2D([0], [0], marker='o', color='w', markerfacecolor=c, markersize=12, label=t)
                        for t, c in type_colors.items()]
     ax.legend(handles=legend_elements, loc='upper left', title='Dominant Type')
-    ax.set_title('Coalition Graph Structure — Node Specialization & Learned Edges')
+    ax.set_title('Coalition Graph — Emergent Clusters from Learned Node Positions')
 
     plt.tight_layout()
     plt.savefig(save_path, dpi=150, bbox_inches='tight')
