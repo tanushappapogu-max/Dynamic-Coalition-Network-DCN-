@@ -8,7 +8,7 @@ data:
   gen_num_ops: [4, 5]
   gen_max_nesting: 2
   max_input_len: 32
-  max_output_len: 4
+  max_output_len: 5
   seed: 42
 
 model:
@@ -18,7 +18,7 @@ model:
   dropout: 0.1
   vocab_size: 20
   max_seq_len: 32
-  max_output_len: 4
+  max_output_len: 5
 
 dense:
   d_ffn: 1024

@@ -85,7 +85,8 @@ def evaluate(model, loader, criterion, device):
         n_batches += 1
 
         preds = logits.argmax(dim=-1)
-        correct += (preds == target_ids).all(dim=-1).sum().item()
+        match = (preds == target_ids) | (target_ids == PAD_IDX)
+        correct += match.all(dim=-1).sum().item()
         total += target_ids.size(0)
 
     return {
@@ -210,6 +211,15 @@ def main():
     with open('configs/experiment.yaml') as f:
         config = yaml.safe_load(f)
 
+    small_mode = '--small' in sys.argv
+    if small_mode:
+        print('=== SMALL MODE: reduced dataset for quick testing ===')
+        config['data']['train_size'] = 2000
+        config['data']['val_size'] = 500
+        config['data']['test_size'] = 500
+        config['data']['gen_test_size'] = 200
+        config['training']['epochs'] = 20
+
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f'Device: {device}')
     if device.type == 'cuda':
@@ -217,10 +227,13 @@ def main():
 
     results = {}
 
-    if '--dense' in sys.argv or '--all' in sys.argv or len(sys.argv) == 1:
+    flags = [a for a in sys.argv[1:] if a != '--small']
+    run_all = len(flags) == 0
+
+    if '--dense' in sys.argv or '--all' in sys.argv or run_all:
         results['dense'] = train_model('dense', config, device)
 
-    if '--moe' in sys.argv or '--all' in sys.argv or len(sys.argv) == 1:
+    if '--moe' in sys.argv or '--all' in sys.argv or run_all:
         results['moe'] = train_model('moe', config, device)
 
     if len(results) > 1:

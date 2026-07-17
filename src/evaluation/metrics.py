@@ -22,7 +22,7 @@ def evaluate_accuracy(model: nn.Module, loader: DataLoader, device: torch.device
 
         result = model(input_ids)
         preds = result['logits'].argmax(dim=-1)
-        matches = (preds == target_ids).all(dim=-1)
+        matches = ((preds == target_ids) | (target_ids == PAD_IDX)).all(dim=-1)
 
         correct += matches.sum().item()
         total += target_ids.size(0)

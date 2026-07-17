@@ -166,7 +166,8 @@ def evaluate(model, loader, criterion, device):
         n_batches += 1
 
         preds = logits.argmax(dim=-1)
-        correct += (preds == target_ids).all(dim=-1).sum().item()
+        match = (preds == target_ids) | (target_ids == PAD_IDX)
+        correct += match.all(dim=-1).sum().item()
         total += target_ids.size(0)
 
     return {
