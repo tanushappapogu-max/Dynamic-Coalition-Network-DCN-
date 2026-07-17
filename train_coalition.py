@@ -220,7 +220,7 @@ def main():
 
     routing_params = model.get_routing_params()
     nonrouting_params = model.get_nonrouting_params()
-    routing_lr = tc['learning_rate'] * 10
+    routing_lr = tc['learning_rate'] * 3
 
     print(f'Routing params: {sum(p.numel() for p in routing_params):,} (lr={routing_lr})')
     print(f'Other params:   {sum(p.numel() for p in nonrouting_params):,} (lr={tc["learning_rate"]})')
