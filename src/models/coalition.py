@@ -35,10 +35,6 @@ class CoalitionGraphFFN(nn.Module):
 
         self.recruit_threshold = nn.Parameter(torch.tensor(0.0))
 
-        # Per-token attention over coalition members
-        self.token_gate = nn.Linear(d_model, n_nodes, bias=False)
-        nn.init.normal_(self.token_gate.weight, std=0.02)
-
         self._temperature = 1.0
 
     @property
@@ -88,25 +84,9 @@ class CoalitionGraphFFN(nn.Module):
 
         # === COMPUTE ===
         node_outputs = torch.stack([node(x) for node in self.nodes], dim=1)
-        # node_outputs: (batch, n_nodes, seq_len, d_model)
 
-        # === PER-TOKEN WEIGHTING ===
-        token_logits = self.token_gate(x)  # (batch, seq_len, n_nodes)
-
-        # Fold routing strength into softmax via log(activation)
-        # At init (token_logits ≈ 0): softmax(log(act)) ∝ act → recovers old behavior exactly
-        log_act = torch.log(node_activation.clamp(min=1e-8)).unsqueeze(1)
-        combined_logits = token_logits + log_act
-
-        active_mask = (node_activation.detach() > 0.01).unsqueeze(1)
-        combined_logits = combined_logits.masked_fill(~active_mask, -1e9)
-        token_weights = F.softmax(combined_logits, dim=-1)
-
-        # Scale to match original output magnitude: sum(activation) / n_seeds
-        scale = node_activation.sum(dim=-1, keepdim=True).unsqueeze(1) / self.n_seeds
-        final_weights = token_weights * scale
-
-        output = torch.einsum('bsn,bnsd->bsd', final_weights, node_outputs)
+        norm_weights = node_activation / self.n_seeds
+        output = (norm_weights.unsqueeze(-1).unsqueeze(-1) * node_outputs).sum(dim=1)
 
         aux_data = {
             'node_activation': node_activation,
@@ -116,7 +96,6 @@ class CoalitionGraphFFN(nn.Module):
             'similarity_matrix': similarity.detach(),
             'positions': self.positions.detach(),
             'seed_scores': seed_scores.detach(),
-            'token_attn': token_weights.detach(),
             'type': 'coalition',
         }
         return output, aux_data
