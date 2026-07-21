@@ -32,6 +32,8 @@ class CoalitionGraphFFN(nn.Module):
         pos_init = torch.randn(n_nodes, d_pos)
         pos_init = pos_init / pos_init.norm(dim=1, keepdim=True)
         self.positions = nn.Parameter(pos_init)
+        # Snapshot of the random init, used by graph_mode='frozen'
+        self.register_buffer('positions_init', pos_init.clone())
 
         self.recruit_threshold = nn.Parameter(torch.tensor(0.0))
 
@@ -39,6 +41,15 @@ class CoalitionGraphFFN(nn.Module):
         # Ablation switch: False => coalition is seeds ONLY (no proximity
         # recruitment). Isolates whether the recruitment mechanism does anything.
         self._recruit_enabled = True
+        # How the node graph is built -- the open question vs SymphonySMoE
+        # (arXiv 2510.16411), which constructs its expert graph from weight
+        # similarity and never compares against a learned one.
+        #   'learned' : cosine sim of `positions`, trained by gradient descent (ours)
+        #   'weights' : cosine sim of each node's first-layer weights (SymphonySMoE-style,
+        #               recomputed from current weights, not itself learned)
+        #   'frozen'  : cosine sim of `positions` held at random init -- control that
+        #               asks whether the graph must be LEARNED or merely EXIST
+        self._graph_mode = 'learned'
         # Normalization: 'n_seeds' is v5's original (weights can sum to >1 when
         # recruits are added, so recruitment also inflates output magnitude).
         # 'sum' divides by the true activation sum, holding magnitude at 1 so an
@@ -71,9 +82,19 @@ class CoalitionGraphFFN(nn.Module):
         seed_activation = hard_seed_mask - soft_seed_weights.detach() + soft_seed_weights
 
         # === RECRUITMENT via position proximity ===
-        # Compute pairwise similarity between all node positions
-        pos_norm = F.normalize(self.positions, dim=1)  # (n_nodes, d_pos)
-        similarity = pos_norm @ pos_norm.T  # (n_nodes, n_nodes), range [-1, 1]
+        # The node-node graph. How it's built is the ablation vs SymphonySMoE.
+        if self._graph_mode == 'weights':
+            # SymphonySMoE-style: graph derived from expert WEIGHT similarity
+            # rather than learned coordinates. Detached -- the graph is read off
+            # the weights, it is not itself trained.
+            w = torch.stack([n[0].weight.reshape(-1) for n in self.nodes]).detach()
+            basis = F.normalize(w, dim=1)
+        elif self._graph_mode == 'frozen':
+            # Control: a graph that exists but never learned.
+            basis = F.normalize(self.positions_init, dim=1)
+        else:
+            basis = F.normalize(self.positions, dim=1)  # (n_nodes, d_pos)
+        similarity = basis @ basis.T  # (n_nodes, n_nodes), range [-1, 1]
 
         # For each batch element, compute how close each node is to the active seeds
         # seed_activation: (batch, n_nodes), similarity: (n_nodes, n_nodes)
@@ -157,6 +178,13 @@ class CoalitionModel(BaseModel):
         for layer in self.layers:
             if isinstance(layer.ffn, CoalitionGraphFFN):
                 layer.ffn._norm_mode = mode
+
+    def set_graph_mode(self, mode: str):
+        """'learned' (ours) | 'weights' (SymphonySMoE-style) | 'frozen' (control)."""
+        assert mode in ('learned', 'weights', 'frozen'), mode
+        for layer in self.layers:
+            if isinstance(layer.ffn, CoalitionGraphFFN):
+                layer.ffn._graph_mode = mode
 
     def get_temperature(self) -> float:
         for layer in self.layers:
