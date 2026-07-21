@@ -36,6 +36,14 @@ class CoalitionGraphFFN(nn.Module):
         self.recruit_threshold = nn.Parameter(torch.tensor(0.0))
 
         self._temperature = 1.0
+        # Ablation switch: False => coalition is seeds ONLY (no proximity
+        # recruitment). Isolates whether the recruitment mechanism does anything.
+        self._recruit_enabled = True
+        # Normalization: 'n_seeds' is v5's original (weights can sum to >1 when
+        # recruits are added, so recruitment also inflates output magnitude).
+        # 'sum' divides by the true activation sum, holding magnitude at 1 so an
+        # ablation measures recruitment's CHOICE of nodes, not extra magnitude.
+        self._norm_mode = 'n_seeds'
 
     @property
     def temperature(self):
@@ -75,9 +83,13 @@ class CoalitionGraphFFN(nn.Module):
         # Subtract self-proximity (seeds shouldn't recruit themselves)
         proximity = proximity - seed_activation * 1.0  # remove self-similarity contribution
 
-        recruit_tau = max(tau, 0.5)
-        recruit_activation = torch.sigmoid((proximity - self.recruit_threshold) / recruit_tau)
-        recruit_activation = recruit_activation * (1.0 - hard_seed_mask)
+        if self._recruit_enabled:
+            recruit_tau = max(tau, 0.5)
+            recruit_activation = torch.sigmoid((proximity - self.recruit_threshold) / recruit_tau)
+            recruit_activation = recruit_activation * (1.0 - hard_seed_mask)
+        else:
+            # Ablation: no neighbours pulled in — coalition is the seeds alone.
+            recruit_activation = torch.zeros_like(seed_activation)
 
         # === COMBINE ===
         node_activation = seed_activation + recruit_activation
@@ -85,7 +97,11 @@ class CoalitionGraphFFN(nn.Module):
         # === COMPUTE ===
         node_outputs = torch.stack([node(x) for node in self.nodes], dim=1)
 
-        norm_weights = node_activation / self.n_seeds
+        if self._norm_mode == 'sum':
+            denom = node_activation.sum(dim=1, keepdim=True).clamp(min=1e-8)
+        else:
+            denom = self.n_seeds
+        norm_weights = node_activation / denom
         output = (norm_weights.unsqueeze(-1).unsqueeze(-1) * node_outputs).sum(dim=1)
 
         aux_data = {
@@ -129,6 +145,18 @@ class CoalitionModel(BaseModel):
         for layer in self.layers:
             if isinstance(layer.ffn, CoalitionGraphFFN):
                 layer.ffn.temperature = temperature
+
+    def set_recruitment(self, enabled: bool):
+        """Ablation: turn proximity recruitment off to test whether it matters."""
+        for layer in self.layers:
+            if isinstance(layer.ffn, CoalitionGraphFFN):
+                layer.ffn._recruit_enabled = enabled
+
+    def set_norm_mode(self, mode: str):
+        """'n_seeds' = v5 original; 'sum' = magnitude-controlled for fair ablation."""
+        for layer in self.layers:
+            if isinstance(layer.ffn, CoalitionGraphFFN):
+                layer.ffn._norm_mode = mode
 
     def get_temperature(self) -> float:
         for layer in self.layers:
