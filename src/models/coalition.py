@@ -55,6 +55,9 @@ class CoalitionGraphFFN(nn.Module):
         # 'sum' divides by the true activation sum, holding magnitude at 1 so an
         # ablation measures recruitment's CHOICE of nodes, not extra magnitude.
         self._norm_mode = 'n_seeds'
+        # v7: emit the complementarity penalty (see forward). Off by default so
+        # v5/v6 behaviour and results are byte-identical.
+        self._complement_enabled = False
 
     @property
     def temperature(self):
@@ -125,6 +128,28 @@ class CoalitionGraphFFN(nn.Module):
         norm_weights = node_activation / denom
         output = (norm_weights.unsqueeze(-1).unsqueeze(-1) * node_outputs).sum(dim=1)
 
+        # === COMPLEMENTARITY SIGNAL (v7) ===
+        # Diagnosis of v6's failure: proximity -> co-firing -> shared gradients ->
+        # nodes near each other learn the SAME function, so recruiting a neighbour
+        # adds a near-duplicate. (Measured: tsim rose to ~0.98 with recruitment.)
+        #
+        # This term is (position similarity x function similarity). Minimising it
+        # forces nodes that sit close together to compute DIFFERENT things, which
+        # flips the meaning of the space from "near = same as me" to
+        # "near = complements me". Returned raw; the training loop weights it.
+        if self._complement_enabled:
+            # mean function of each node over the batch: (n_nodes, d_model)
+            node_fn = node_outputs.mean(dim=(0, 2))
+            fn_sim = F.normalize(node_fn, dim=1) @ F.normalize(node_fn, dim=1).T
+            off = 1.0 - torch.eye(self.n_nodes, device=x.device)
+            # fn_sim is SQUARED so the optimum is 0 (orthogonal / unrelated), not
+            # -1 (opposite). Two co-firing nodes computing opposite functions would
+            # cancel each other out -- that is waste, not complementarity.
+            # Only pairs actually close in position space are penalised.
+            complement_penalty = (similarity.clamp(min=0.0) * fn_sim.pow(2) * off).mean()
+        else:
+            complement_penalty = torch.zeros((), device=x.device)
+
         aux_data = {
             'node_activation': node_activation,
             'seed_activation': seed_activation,
@@ -133,6 +158,7 @@ class CoalitionGraphFFN(nn.Module):
             'similarity_matrix': similarity.detach(),
             'positions': self.positions.detach(),
             'seed_scores': seed_scores.detach(),
+            'complement_penalty': complement_penalty,
             'type': 'coalition',
         }
         return output, aux_data
@@ -185,6 +211,12 @@ class CoalitionModel(BaseModel):
         for layer in self.layers:
             if isinstance(layer.ffn, CoalitionGraphFFN):
                 layer.ffn._graph_mode = mode
+
+    def set_complement(self, enabled: bool):
+        """v7: make position-proximity mean 'complements me' instead of 'same as me'."""
+        for layer in self.layers:
+            if isinstance(layer.ffn, CoalitionGraphFFN):
+                layer.ffn._complement_enabled = enabled
 
     def get_temperature(self) -> float:
         for layer in self.layers:
