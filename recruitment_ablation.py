@@ -163,9 +163,11 @@ def main():
     testl = DataLoader(datasets['test'], batch_size=256)
     genl = DataLoader(datasets['gen_test'], batch_size=256)
 
-    print(f'=== RECRUITMENT ABLATION ===')
+    print(f'=== v6: RECRUITMENT ABLATION (v5 architecture, seed-verified) ===')
     print(f'device={DEVICE}  d={D_MODEL} L={N_LAYERS} {TRAIN_N} ex, {EPOCHS} ep, '
           f'{N_SEEDS_RUNS} seed(s)\n', flush=True)
+    if N_SEEDS_RUNS < 3:
+        print('NOTE: run with --seeds 3 for the verified result (this is the point of v6).\n', flush=True)
 
     seeds = [1234 + 1000 * i for i in range(N_SEEDS_RUNS)]
     acc = {k: [] for k in ('A_orig', 'A_full', 'B_seedsonly', 'C_matchedk')}
