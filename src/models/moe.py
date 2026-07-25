@@ -6,7 +6,8 @@ from src.models.shared import BaseModel
 
 
 class MoEFFN(nn.Module):
-    def __init__(self, d_model: int, n_experts: int, d_expert: int, top_k: int):
+    def __init__(self, d_model: int, n_experts: int, d_expert: int, top_k: int,
+                 gate_hidden: int = None):
         super().__init__()
         self.n_experts = n_experts
         self.top_k = top_k
@@ -19,7 +20,19 @@ class MoEFFN(nn.Module):
             )
             for _ in range(n_experts)
         ])
-        self.gate = nn.Linear(d_model, n_experts, bias=False)
+        # gate_hidden=None is the standard linear gate. Passing a width gives the
+        # gate a hidden layer, so it can express selectors that are nonlinear in
+        # the input -- without this the baseline is handicapped on any task whose
+        # routing signal is not linearly readable, and a DCN win would just be
+        # "nonlinear beats linear routing" rather than anything about coalitions.
+        if gate_hidden:
+            self.gate = nn.Sequential(
+                nn.Linear(d_model, gate_hidden),
+                nn.GELU(),
+                nn.Linear(gate_hidden, n_experts, bias=False),
+            )
+        else:
+            self.gate = nn.Linear(d_model, n_experts, bias=False)
 
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, dict]:
         batch, seq_len, d_model = x.shape
@@ -57,6 +70,7 @@ class MoEModel(BaseModel):
         mc = config['moe']
 
         def ffn_factory(d_model):
-            return MoEFFN(d_model, mc['n_experts'], mc['d_expert'], mc['top_k'])
+            return MoEFFN(d_model, mc['n_experts'], mc['d_expert'], mc['top_k'],
+                          gate_hidden=mc.get('gate_hidden'))
 
         super().__init__(config, ffn_factory)
