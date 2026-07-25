@@ -62,16 +62,25 @@ DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 # label -> (kind, k_active)
 SPEC = {
-    'dense':      ('dense', None),
-    'bg_all':     ('bg', 16),
-    'bg_k8':      ('bg', 8),
-    'bg_k4':      ('bg', 4),
-    'bg_k2':      ('bg', 2),
-    'moe_linear': ('moe', 4),
-    'v9_subst':   ('v9', 4),
+    'dense':    ('dense', None),
+    'bg_all':   ('bg', 16),
+    'bg_k8':    ('bg', 8),
+    'bg_k4':    ('bg', 4),
+    'bg_k2':    ('bg', 2),
+    # MoE at MATCHED sparsity for each bg point. Comparing one bg point against a
+    # single top_k=4 MoE would compare frontiers at one place and could flatter
+    # whichever happens to sit near its own optimum; bg_k8 beat top_k=4 MoE at
+    # twice the flops, which proves nothing on its own.
+    'moe_k8':   ('moe', 8),
+    'moe_k4':   ('moe', 4),
+    'moe_k2':   ('moe', 2),
+    'v9_subst': ('v9', 4),
 }
-CONDITIONS = ['dense', 'bg_all', 'bg_k8', 'bg_k4', 'bg_k2',
-              'moe_linear', 'v9_subst']
+CONDITIONS = ['dense', 'bg_all',
+              'bg_k8', 'moe_k8',
+              'bg_k4', 'moe_k4',
+              'bg_k2', 'moe_k2',
+              'v9_subst']
 
 
 def base_cfg():
@@ -103,6 +112,7 @@ def build(label):
     if kind == 'dense':
         return DenseModel(cfg), cfg
     if kind == 'moe':
+        cfg['moe']['top_k'] = k
         return MoEModel(cfg), cfg
     if kind == 'v9':
         m = CoalitionModel(cfg); m.set_substitutive(True)
@@ -219,17 +229,21 @@ def main():
         print(f'  {l:8s} vs dense       : {agg(l,"tok")[0]-dn:+.4f} '
               f'at {agg(l,"flops")[0]*100:.1f}% FFN flops')
     print()
-    print(f'  SAME SPARSITY (4 of 16), combination rule is the only difference:')
-    for l in ('bg_k4', 'moe_linear', 'v9_subst'):
-        print(f'    {l:11s} {agg(l,"tok")[0]:.4f}')
+    print('  FRONTIER, matched sparsity -- combination rule is the only difference:')
+    print(f'    {"k/16":>5} {"flops":>7} {"block-gated":>12} {"MoE":>9} {"diff":>9}')
+    diffs = {}
+    for k in (8, 4, 2):
+        b, m = agg(f'bg_k{k}', 'tok')[0], agg(f'moe_k{k}', 'tok')[0]
+        diffs[k] = b - m
+        print(f'    {k:>5} {k/N_BLOCKS*100:>6.1f}% {b:>12.4f} {m:>9.4f} {b-m:>+9.4f}')
     bg4 = agg('bg_k4', 'tok')[0]
-    print(f'    bg_k4 - moe_linear : {bg4-agg("moe_linear","tok")[0]:+.4f}')
-    print(f'    bg_k4 - v9_subst   : {bg4-agg("v9_subst","tok")[0]:+.4f}')
+    print(f'\n    bg_k4 - v9_subst (our old mixture): '
+          f'{bg4-agg("v9_subst","tok")[0]:+.4f}')
     if len(seeds) > 1:
         print(f'  (seed noise ~±{noise:.4f})')
 
     print()
-    beats_mix = (bg4 - agg('moe_linear', 'tok')[0] > thresh and
+    beats_mix = (all(d > thresh for d in diffs.values()) and
                  bg4 - agg('v9_subst', 'tok')[0] > thresh)
     if bg4 - dn > -thresh and beats_mix:
         print('  >>> Block-gating holds dense accuracy at 25% of FFN flops AND beats')
